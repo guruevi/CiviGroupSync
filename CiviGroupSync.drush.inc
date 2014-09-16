@@ -1,4 +1,22 @@
 <?php
+/**
+ * CiviGroupSync Drush Command File
+ * Copyright (C) 2014 Evi Vanoost (evi.vanoost@gmail.com)
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+ */
 function CiviGroupSync_drush_command() {
 	$items = array ();
 	
@@ -34,7 +52,78 @@ function CiviGroupSync_drush_command() {
 			) 
 	) + $defitem;
 	
+	$items ['civigroup-user-create'] = array (
+			'description' => "Create Drupal users from a CiviCRM group",
+			'arguments' => array (
+					'sourceid' => 'Source Group ID or ID\'s separated with a comma' 
+			) 
+	) + $defitem;
+	
 	return $items;
+}
+function CiviGroupSync_user_search($email, $name) {
+	// We use a DB query while looking for the uid to keep things speedy.
+	$uids = array ();
+	if (drush_drupal_major_version () >= 7) {
+		$uid_query = db_query ( "SELECT uid, name FROM {users} WHERE mail = :mail OR name = :name", array (
+				':mail' => $email,
+				':name' => $name 
+		) );
+	} else {
+		$uid_query = db_query ( "SELECT uid, name FROM {users} WHERE mail = '%s' OR name = '%s'", $email, $name );
+	}
+	while ( $uid = drush_db_fetch_object ( $uid_query ) ) {
+		$uids [$uid->uid] = $uid->name;
+	}
+	return (count ( $uids ));
+}
+function drush_CiviGroupSync_civigroup_user_create($groupids) {
+	$groups = CiviGroupSync_split ( $groupids );
+	if (empty ( $groups )) {
+		drush_set_error ( "Error validating groups for user create" );
+		return false;
+	}
+	civicrm_initialize ();
+	$final_group = array ();
+	foreach ( $groups as $groupid ) {
+		// Get all the entities from these groups
+		$final_group += CiviGroupSync_getGroupContactDetails ( $groupid );
+	}
+	foreach ( $final_group as $entity ) {
+		if ($error = user_validate_mail ( $entity ['email'] )) {
+			drush_print ( $entity ['email'] . ": " . $error );
+			continue;
+		} elseif ($error = user_validate_name ( $entity ['nick_name'] )) {
+			drush_print ( $entity ['nick_name'] . ": " . $error );
+			continue;
+		} elseif (CiviGroupSync_user_search ( $entity ['email'], $entity ['nick_name'] ) != 0) {
+			if ($print = drush_get_option ( 'print' )) {
+				drush_print ( "A user account for " . $entity ['nick_name'] . " already exists" );
+			}
+			continue;
+		}
+		
+		$new_user = array (
+				'name' => $entity ['nick_name'],
+				'mail' => $entity ['email'],
+				'pass' => user_password ( 10 ),
+				'status' => 1,
+				'init' => $entity ['email'] 
+		);
+		
+		if (! drush_get_option ( 'test' )) {
+			if ($account = user_save ( null, $new_user )) {
+				if ($print = drush_get_option ( 'print' )) {
+					drush_print ( "Account created: " . print_r ( $account, 1 ) );
+				}
+				_user_mail_notify ( 'register_admin_created', $account );
+			} else {
+				drush_print ( "Could not create a new user account with the name " . $entity ['nick_name'] . "." );
+			}
+		} else {
+			drush_print ( "Account created (test): " . $entity ['nick_name'] );
+		}
+	}
 }
 function drush_CiviGroupSync_civigroup_sync($sourceids, $targetids) {
 	$sources = CiviGroupSync_split ( $sourceids );
@@ -73,12 +162,20 @@ function drush_CiviGroupSync_civigroup_sync($sourceids, $targetids) {
 		}
 		// If we need to print out the result, fetch the group and print it
 		if ($print = drush_get_option ( 'print' )) {
-			drush_print ("Resulting Group: " . json_encode ( CiviGroupSync_getGroupContact ( $targetid ) ) );
+			drush_print ( "Resulting Group: " . json_encode ( CiviGroupSync_getGroupContact ( $targetid ) ) );
 		}
 	}
 }
 function CiviGroupSync_getGroupContact($groupid) {
 	$return = array ();
+	if ($result = CiviGroupSync_getGroupContactDetails ( $groupid )) {
+		foreach ( $result as $entity ) {
+			$return [] = $entity ["id"];
+		}
+	}
+	return $return;
+}
+function CiviGroupSync_getGroupContactDetails($groupid) {
 	// First find out the type of group
 	try {
 		// entity=GroupContact&action=get&group_id=4
@@ -100,60 +197,28 @@ function CiviGroupSync_getGroupContact($groupid) {
 		drush_print ( "Invalid group specified" );
 		return false;
 	}
-	if (in_array ( 1, $result ['values'] [$groupid] ["group_type"] )) {
-		try {
-			// entity=GroupContact&action=get&group_id=4
-			$result = civicrm_api ( 'GroupContact', 'get', array (
-					'group_id' => $groupid,
-					'version' => 3,
-					'options' => array (
-							'limit' => 0 
-					) 
-			) );
-		} catch ( CiviCRM_API3_Exception $e ) {
-			$errorMessage = $e->getMessage ();
-			$errorCode = $e->getErrorCode ();
-			$errorData = $e->getExtraParams ();
-			drush_log ( dt ( "!error", array (
-					'!error' => $errorData 
-			), 'error' ) );
-			continue;
-		}
-		foreach ( $result ['values'] as $entity ) {
-			// "id":"6","group_id":"4","contact_id":"4","status":"Added"
-			if ($entity ["status"] == "Added") {
-				$return [] = $entity ["contact_id"];
-			}
-		}
-	} elseif (in_array ( 2, $result ['values'] [$groupid] ["group_type"] )) {
-		// This is probably more expensive than doing it the other way:
-		// This also doesn't work if the group id doesn't exist (it returns all objects)
-		// entity=Contact&action=get&debug=1&sequential=1&json=1&group=2
-		try {
-			// entity=GroupContact&action=get&group_id=4
-			$result = civicrm_api ( 'Contact', 'get', array (
-					'group' => $groupid,
-					'version' => 3,
-					'options' => array (
-							'limit' => 0 
-					) 
-			) );
-		} catch ( CiviCRM_API3_Exception $e ) {
-			$errorMessage = $e->getMessage ();
-			$errorCode = $e->getErrorCode ();
-			$errorData = $e->getExtraParams ();
-			drush_log ( dt ( "!error", array (
-					'!error' => $errorData 
-			), 'error' ) );
-			continue;
-		}
-		foreach ( $result ['values'] as $entity ) {
-			$return [] = $entity ["id"];
-		}
-	} else {
-		die ( dt ( "Invalid or unhandled group type: " ) . print_r ( $result ['values'] [$groupid] ["group_type"], 1 ) );
+	// This is probably more expensive than doing it the other way:
+	// entity=Contact&action=get&debug=1&sequential=1&json=1&group=2
+	try {
+		// entity=GroupContact&action=get&group_id=4
+		$result = civicrm_api ( 'Contact', 'get', array (
+				'group' => $groupid,
+				'version' => 3,
+				'return' => 'nick_name,email',
+				'options' => array (
+						'limit' => 0 
+				) 
+		) );
+	} catch ( CiviCRM_API3_Exception $e ) {
+		$errorMessage = $e->getMessage ();
+		$errorCode = $e->getErrorCode ();
+		$errorData = $e->getExtraParams ();
+		drush_log ( dt ( "!error", array (
+				'!error' => $errorData 
+		), 'error' ) );
+		continue;
 	}
-	return $return;
+	return $result ['values'];
 }
 function CiviGroupSync_createGroupContact($groupid, $contactid) {
 	if (drush_get_option ( 'print' )) {
@@ -226,6 +291,7 @@ function drush_CiviGroupSync_civigroup_merge($sourceids, $targetids) {
 	// For each of the targets, "merge" them with the final group and save them
 	foreach ( $targets as $targetid ) {
 		// First we need to fetch the entities already in this group (so we don't add an already existing entity)
+		
 		$this_group = CiviGroupSync_getGroupContact ( $targetid );
 		
 		// Filter out the already existing entities
