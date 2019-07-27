@@ -190,7 +190,7 @@ function CiviGroupSync_getGroupContactDetails($groupid) {
 		drush_log ( dt ( "!error", array (
 				'!error' => $errorData 
 		), 'error' ) );
-		continue;
+        return;
 	}
 	
 	if ($result ['count'] != 1) {
@@ -216,7 +216,7 @@ function CiviGroupSync_getGroupContactDetails($groupid) {
 		drush_log ( dt ( "!error", array (
 				'!error' => $errorData 
 		), 'error' ) );
-		continue;
+        return;
 	}
 	return $result ['values'];
 }
